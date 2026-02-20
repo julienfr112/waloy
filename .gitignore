@@ -1,0 +1,11 @@
+/target
+Cargo.lock
+app.db
+app.db-*
+garage/garage
+garage/data/
+garage/metadata/
+garage/config/
+garage/garage.log
+garage/garage.pid
+garage/credentials.env
