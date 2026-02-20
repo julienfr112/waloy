@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
@@ -11,9 +10,30 @@ use crate::s3::S3Client;
 use crate::stats::{BackupStats, StatsTracker};
 
 const WAL_HEADER_SIZE: u64 = 32;
+const WAL_FRAME_HEADER_SIZE: u64 = 24;
 /// Offset of the salt fields in the WAL header (bytes 16..24).
 const WAL_SALT_OFFSET: usize = 16;
 const WAL_SALT_LEN: usize = 8;
+
+/// Compute the largest prefix of `wal_data` that contains only complete frames.
+/// Returns `WAL_HEADER_SIZE` (i.e. zero complete frames) if the WAL is too short
+/// or the page size cannot be parsed.
+fn wal_aligned_len(wal_data: &[u8]) -> u64 {
+    let len = wal_data.len() as u64;
+    if len < WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE {
+        return WAL_HEADER_SIZE.min(len);
+    }
+    // Page size is stored as big-endian u32 at bytes 8..12 of the WAL header.
+    let page_size =
+        u32::from_be_bytes([wal_data[8], wal_data[9], wal_data[10], wal_data[11]]) as u64;
+    if page_size == 0 {
+        return WAL_HEADER_SIZE;
+    }
+    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+    let data_after_header = len - WAL_HEADER_SIZE;
+    let complete_frames = data_after_header / frame_size;
+    WAL_HEADER_SIZE + complete_frames * frame_size
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -50,6 +70,8 @@ pub struct BackupManager {
     last_snapshot_time: Instant,
     /// Whether shutdown() has been called.
     shutdown_complete: bool,
+    /// Whether a read transaction is currently active.
+    has_read_transaction: bool,
 }
 
 impl BackupManager {
@@ -61,7 +83,11 @@ impl BackupManager {
     /// - Takes an initial full snapshot and uploads it to S3
     pub async fn new(config: BackupConfig) -> Result<Self> {
         // Auto-restore: if DB doesn't exist and flag is set, restore from S3
-        if config.auto_restore && !Path::new(&config.db_path).exists() {
+        if config.auto_restore
+            && !tokio::fs::try_exists(&config.db_path)
+                .await
+                .unwrap_or(false)
+        {
             tracing::info!(db_path = %config.db_path, "DB not found, auto-restoring from S3");
             Self::restore_with_config(&config, &config.db_path).await?;
         }
@@ -97,6 +123,7 @@ impl BackupManager {
             stats: StatsTracker::new(),
             last_snapshot_time: Instant::now(),
             shutdown_complete: false,
+            has_read_transaction: true,
         };
 
         mgr.snapshot().await?;
@@ -104,16 +131,24 @@ impl BackupManager {
     }
 
     /// Begin a long-running read transaction to pin the WAL.
-    fn begin_read_transaction(&self) -> Result<()> {
+    fn begin_read_transaction(&mut self) -> Result<()> {
+        if self.has_read_transaction {
+            return Ok(());
+        }
         self.read_conn.execute_batch("BEGIN")?;
         self.read_conn
             .query_row("SELECT 1 FROM sqlite_master LIMIT 1", [], |_| Ok(()))?;
+        self.has_read_transaction = true;
         Ok(())
     }
 
     /// End the read transaction (best-effort, ignores errors).
-    fn end_read_transaction(&self) {
+    fn end_read_transaction(&mut self) {
+        if !self.has_read_transaction {
+            return;
+        }
         let _ = self.read_conn.execute_batch("COMMIT");
+        self.has_read_transaction = false;
     }
 
     fn wal_path(&self) -> String {
@@ -149,8 +184,11 @@ impl BackupManager {
     }
 
     /// Upload a full copy of the database file as a snapshot.
+    ///
+    /// Safety: the active read transaction prevents SQLite from checkpointing,
+    /// so the DB file is stable and safe to read even while the application writes.
     pub async fn snapshot(&mut self) -> Result<()> {
-        let raw_data = std::fs::read(&self.config.db_path)?;
+        let raw_data = tokio::fs::read(&self.config.db_path).await?;
         let data = self.pipeline_encode(&raw_data)?;
         let key = format!("{}/snapshot", self.generation);
         self.s3.put_object(&key, &data).await?;
@@ -177,15 +215,15 @@ impl BackupManager {
         Ok(())
     }
 
-    /// Sync new WAL frames to S3. Only uploads bytes added since the last sync.
-    /// Returns true if new data was uploaded.
+    /// Sync new WAL frames to S3. Only uploads complete, frame-aligned data
+    /// added since the last sync. Returns true if new data was uploaded.
     pub async fn sync_wal(&mut self) -> Result<bool> {
         let wal_path = self.wal_path();
-        if !Path::new(&wal_path).exists() {
+        if !tokio::fs::try_exists(&wal_path).await.unwrap_or(false) {
             return Ok(false);
         }
 
-        let wal_data = std::fs::read(&wal_path)?;
+        let wal_data = tokio::fs::read(&wal_path).await?;
         let wal_len = wal_data.len() as u64;
 
         // Nothing new, or WAL has only header (no frames)
@@ -208,11 +246,14 @@ impl BackupManager {
             self.wal_header_salt = Some(salt);
         }
 
-        if wal_len <= self.wal_offset {
+        // Only sync up to the last complete frame boundary to avoid uploading
+        // partial (torn) frames that could corrupt restore.
+        let aligned_len = wal_aligned_len(&wal_data);
+        if aligned_len <= WAL_HEADER_SIZE || aligned_len <= self.wal_offset {
             return Ok(false);
         }
 
-        let new_data = &wal_data[self.wal_offset as usize..];
+        let new_data = &wal_data[self.wal_offset as usize..aligned_len as usize];
         let encoded = self.pipeline_encode(new_data)?;
         let key = format!("{}/wal/{:08}", self.generation, self.wal_index);
         self.s3.put_object(&key, &encoded).await?;
@@ -232,7 +273,7 @@ impl BackupManager {
         self.upload_manifest().await?;
 
         self.stats.record_sync(encoded.len() as u64);
-        self.wal_offset = wal_len;
+        self.wal_offset = aligned_len;
         self.wal_index += 1;
         Ok(true)
     }
@@ -276,8 +317,7 @@ impl BackupManager {
         self.sync_wal().await?;
 
         // Release the read transaction so checkpoint can proceed.
-        // Unlike recover/shutdown, we need this to succeed before checkpointing.
-        self.read_conn.execute_batch("COMMIT")?;
+        self.end_read_transaction();
 
         // Checkpoint: write WAL pages back to DB and truncate WAL
         self.read_conn
@@ -288,11 +328,12 @@ impl BackupManager {
         self.manifest = GenerationManifest::new(self.generation.clone(), now_ms());
         self.stats.record_new_generation();
 
-        // Take a fresh snapshot (DB is now fully up to date)
-        self.snapshot().await?;
-
-        // Re-acquire read transaction to pin the WAL again
+        // Take a fresh snapshot (DB is now fully up to date).
+        // Always re-acquire the read transaction even if snapshot fails,
+        // so the manager is left in a consistent state with the WAL pinned.
+        let snapshot_result = self.snapshot().await;
         self.begin_read_transaction()?;
+        snapshot_result?;
 
         tracing::info!(generation = %self.generation, "checkpoint complete, new generation");
         Ok(())
@@ -354,11 +395,14 @@ impl BackupManager {
     }
 
     /// Upload the current generation manifest to S3.
+    /// The manifest is passed through the encode pipeline (compression + encryption)
+    /// so it stays protected when client-side encryption is enabled.
     async fn upload_manifest(&mut self) -> Result<()> {
         let json = serde_json::to_vec(&self.manifest)
             .map_err(|e| Error::Other(format!("manifest serialize: {e}")))?;
+        let encoded = self.pipeline_encode(&json)?;
         let key = format!("{}/manifest.json", self.generation);
-        self.s3.put_object(&key, &json).await
+        self.s3.put_object(&key, &encoded).await
     }
 
     /// Enforce retention policy: delete generations older than retention_duration.
@@ -401,7 +445,7 @@ impl BackupManager {
                 let gen_id = key.trim_end_matches("/manifest.json").to_string();
                 match self.s3.get_object(key).await {
                     Ok(data) => {
-                        if let Ok(m) = serde_json::from_slice::<GenerationManifest>(&data) {
+                        if let Ok(m) = Self::decode_manifest(&data, &self.config) {
                             manifests.push((gen_id, m));
                         }
                     }
@@ -411,6 +455,17 @@ impl BackupManager {
         }
 
         Ok(manifests)
+    }
+
+    /// Decode a manifest from raw S3 data, handling both encrypted and plain formats.
+    fn decode_manifest(
+        data: &[u8],
+        config: &BackupConfig,
+    ) -> Result<GenerationManifest> {
+        // Try decode pipeline first (handles encrypted manifests)
+        let decoded = Self::pipeline_decode(data, config)?;
+        serde_json::from_slice::<GenerationManifest>(&decoded)
+            .map_err(|e| Error::Other(format!("manifest deserialize: {e}")))
     }
 
     /// Delete all S3 objects belonging to a generation.
@@ -427,34 +482,40 @@ impl BackupManager {
     }
 
     /// Compact WAL segments in the current generation: download all, merge, re-upload.
+    ///
+    /// Crash-safe: new segments are written at indices above the current max,
+    /// so existing segments are never overwritten. The manifest is updated only
+    /// after all new segments are uploaded. Old segments are deleted last.
     pub async fn compact(&mut self, max_segment_size: Option<usize>) -> Result<CompactionResult> {
         let max_size = max_segment_size.unwrap_or(4 * 1024 * 1024); // 4MB default
 
-        let wal_prefix = format!("{}/wal/", self.generation);
-        let segment_keys = self.s3.list_keys(&wal_prefix).await?;
-
-        if segment_keys.len() <= 1 {
+        if self.manifest.segments.len() <= 1 {
             return Ok(CompactionResult {
-                segments_before: segment_keys.len() as u32,
-                segments_after: segment_keys.len() as u32,
+                segments_before: self.manifest.segments.len() as u32,
+                segments_after: self.manifest.segments.len() as u32,
             });
         }
 
-        let segments_before = segment_keys.len() as u32;
+        let segments_before = self.manifest.segments.len() as u32;
 
-        // Download all segments
+        // Download all segments referenced in the manifest
         let mut all_data = Vec::new();
-        for key in &segment_keys {
+        let old_segment_keys: Vec<String> = self
+            .manifest
+            .segments
+            .iter()
+            .map(|s| format!("{}/wal/{:08}", self.generation, s.index))
+            .collect();
+
+        for key in &old_segment_keys {
             let data = self.s3.get_object(key).await?;
             let decoded = Self::pipeline_decode(&data, &self.config)?;
             all_data.extend_from_slice(&decoded);
         }
 
-        // Delete old segments
-        self.s3.delete_objects(&segment_keys).await?;
-
-        // Re-upload as fewer, larger segments
-        let mut new_index = 0u32;
+        // Upload new segments at indices starting after the current max.
+        // This guarantees no existing key is overwritten.
+        let mut new_index = self.wal_index;
         let mut new_segments = Vec::new();
         let mut offset = 0usize;
 
@@ -476,14 +537,19 @@ impl BackupManager {
             new_index += 1;
         }
 
-        let segments_after = new_index;
+        let segments_after = new_segments.len() as u32;
 
-        // Update manifest with new segments
+        // Update manifest to reference only the new segments, then upload.
+        // Crash before this point: manifest still references old segments (safe).
         self.manifest.segments = new_segments;
         self.upload_manifest().await?;
 
-        // Update internal tracking
+        // Update internal tracking so future segments don't collide
         self.wal_index = new_index;
+
+        // Delete old segment keys. Crash here: orphaned old segments waste
+        // space but are harmless — cleaned up on next compaction or retention.
+        self.s3.delete_objects(&old_segment_keys).await?;
 
         tracing::info!(
             before = segments_before,
@@ -563,7 +629,9 @@ impl BackupManager {
         decode_config: &BackupConfig,
         target_path: &str,
     ) -> Result<()> {
-        // Find the latest generation
+        // Find the latest generation.
+        // Safety: the `latest` marker is updated only after the snapshot is
+        // successfully uploaded, so it always points to a valid generation.
         let gen_bytes = s3
             .get_object("latest")
             .await
@@ -577,11 +645,13 @@ impl BackupManager {
         let snapshot_key = format!("{}/snapshot", generation);
         let snapshot_data = s3.get_object(&snapshot_key).await?;
         let snapshot_decoded = Self::pipeline_decode(&snapshot_data, decode_config)?;
-        std::fs::write(target_path, &snapshot_decoded)?;
+        tokio::fs::write(target_path, &snapshot_decoded).await?;
 
-        // Download WAL segments
-        let wal_prefix = format!("{}/wal/", generation);
-        let segment_keys = s3.list_keys(&wal_prefix).await?;
+        // Download WAL segments using manifest for ordering (required after
+        // compaction, since segment indices may be non-contiguous).
+        // Fall back to list_keys if manifest is missing or unparseable.
+        let segment_keys =
+            Self::segment_keys_from_manifest(s3, decode_config, &generation).await;
 
         if !segment_keys.is_empty() {
             let mut wal_data = Vec::new();
@@ -591,10 +661,18 @@ impl BackupManager {
                 wal_data.extend_from_slice(&decoded);
             }
             let wal_path = format!("{}-wal", target_path);
-            std::fs::write(&wal_path, &wal_data)?;
+            tokio::fs::write(&wal_path, &wal_data).await?;
+
+            // fsync WAL file to ensure durability
+            let wal_file = tokio::fs::File::open(&wal_path).await?;
+            wal_file.sync_all().await?;
 
             tracing::info!(segments = segment_keys.len(), "WAL segments downloaded");
         }
+
+        // fsync snapshot file
+        let snap_file = tokio::fs::File::open(target_path).await?;
+        snap_file.sync_all().await?;
 
         // Open and close the DB to trigger WAL replay, then clean up
         let conn = Connection::open(target_path)?;
@@ -606,6 +684,33 @@ impl BackupManager {
         Ok(())
     }
 
+    /// Resolve segment keys for a generation from its manifest.
+    /// Falls back to list_keys if the manifest is missing or unparseable.
+    async fn segment_keys_from_manifest(
+        s3: &S3Client,
+        decode_config: &BackupConfig,
+        generation: &str,
+    ) -> Vec<String> {
+        let manifest_key = format!("{}/manifest.json", generation);
+        if let Ok(data) = s3.get_object(&manifest_key).await
+            && let Ok(manifest) = Self::decode_manifest(&data, decode_config)
+        {
+            return manifest
+                .segments
+                .iter()
+                .map(|s| format!("{}/wal/{:08}", generation, s.index))
+                .collect();
+        }
+        // Fallback: list keys (backward compat with pre-manifest backups)
+        let wal_prefix = format!("{}/wal/", generation);
+        s3.list_keys(&wal_prefix).await.unwrap_or_default()
+    }
+
+    /// Point-in-time restore.
+    ///
+    /// Note: segment timestamps reflect upload time, not the time the WAL frames
+    /// were written by the application. PITR granularity is therefore limited to
+    /// the sync interval.
     async fn restore_pitr(
         s3: &S3Client,
         decode_config: &BackupConfig,
@@ -619,7 +724,7 @@ impl BackupManager {
         for key in &all_keys {
             if key.ends_with("/manifest.json")
                 && let Ok(data) = s3.get_object(key).await
-                && let Ok(m) = serde_json::from_slice::<GenerationManifest>(&data)
+                && let Ok(m) = Self::decode_manifest(&data, decode_config)
             {
                 manifests.push(m);
             }
@@ -655,7 +760,7 @@ impl BackupManager {
         let snapshot_key = format!("{}/snapshot", manifest.generation);
         let snapshot_data = s3.get_object(&snapshot_key).await?;
         let snapshot_decoded = Self::pipeline_decode(&snapshot_data, decode_config)?;
-        std::fs::write(target_path, &snapshot_decoded)?;
+        tokio::fs::write(target_path, &snapshot_decoded).await?;
 
         // Download WAL segments up to target timestamp
         let segments_to_replay: Vec<&crate::manifest::SegmentMeta> = manifest
@@ -673,13 +778,21 @@ impl BackupManager {
                 wal_data.extend_from_slice(&decoded);
             }
             let wal_path = format!("{}-wal", target_path);
-            std::fs::write(&wal_path, &wal_data)?;
+            tokio::fs::write(&wal_path, &wal_data).await?;
+
+            // fsync WAL file
+            let wal_file = tokio::fs::File::open(&wal_path).await?;
+            wal_file.sync_all().await?;
 
             tracing::info!(
                 segments = segments_to_replay.len(),
                 "WAL segments replayed for PITR"
             );
         }
+
+        // fsync snapshot file
+        let snap_file = tokio::fs::File::open(target_path).await?;
+        snap_file.sync_all().await?;
 
         let conn = Connection::open(target_path)?;
         conn.execute_batch("PRAGMA journal_mode = WAL")?;
@@ -777,6 +890,69 @@ mod tests {
         // WAL data is only 20 bytes — not enough for salt at offset 16..24
         let wal_data = vec![0u8; 20];
         assert!(!check_wal_discontinuity(0, Some(&old_salt), &wal_data, 20));
+    }
+
+    // --- wal_aligned_len tests ---
+
+    fn make_wal_header(page_size: u32) -> Vec<u8> {
+        let mut header = vec![0u8; WAL_HEADER_SIZE as usize];
+        // Page size at bytes 8..12, big-endian
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        header
+    }
+
+    #[test]
+    fn wal_aligned_len_empty() {
+        assert_eq!(wal_aligned_len(&[]), 0);
+    }
+
+    #[test]
+    fn wal_aligned_len_header_only() {
+        let header = make_wal_header(4096);
+        assert_eq!(wal_aligned_len(&header), WAL_HEADER_SIZE);
+    }
+
+    #[test]
+    fn wal_aligned_len_one_complete_frame() {
+        let page_size = 4096u32;
+        let frame_size = WAL_FRAME_HEADER_SIZE as usize + page_size as usize;
+        let mut data = make_wal_header(page_size);
+        data.resize(WAL_HEADER_SIZE as usize + frame_size, 0);
+        assert_eq!(
+            wal_aligned_len(&data),
+            WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + page_size as u64
+        );
+    }
+
+    #[test]
+    fn wal_aligned_len_partial_frame_truncated() {
+        let page_size = 4096u32;
+        let frame_size = WAL_FRAME_HEADER_SIZE as usize + page_size as usize;
+        let mut data = make_wal_header(page_size);
+        // One complete frame + 100 bytes of a partial second frame
+        data.resize(WAL_HEADER_SIZE as usize + frame_size + 100, 0);
+        assert_eq!(
+            wal_aligned_len(&data),
+            WAL_HEADER_SIZE + frame_size as u64
+        );
+    }
+
+    #[test]
+    fn wal_aligned_len_two_complete_frames() {
+        let page_size = 4096u32;
+        let frame_size = WAL_FRAME_HEADER_SIZE as usize + page_size as usize;
+        let mut data = make_wal_header(page_size);
+        data.resize(WAL_HEADER_SIZE as usize + frame_size * 2, 0);
+        assert_eq!(
+            wal_aligned_len(&data),
+            WAL_HEADER_SIZE + (frame_size * 2) as u64
+        );
+    }
+
+    #[test]
+    fn wal_aligned_len_zero_page_size() {
+        let data = make_wal_header(0);
+        assert_eq!(wal_aligned_len(&data), WAL_HEADER_SIZE);
     }
 
     // --- now_ms tests ---
